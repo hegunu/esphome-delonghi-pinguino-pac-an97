@@ -1,0 +1,221 @@
+substitutions:
+  name: "xiao-ir-mate-7d3178"
+  friendly_name: "DeLonghi Pinguino"
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+
+esp32:
+  board: seeed_xiao_esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    password: !secret ap_password
+
+captive_portal:
+
+remote_transmitter:
+  pin: GPIO3
+  carrier_duty_percent: 50%
+  non_blocking: true
+
+output:
+  - platform: gpio
+    id: vibration_output
+    pin: GPIO6
+
+switch:
+  - platform: output
+    id: vibration_switch
+    name: "Vibration"
+    output: vibration_output
+
+remote_receiver:
+  pin:
+    number: GPIO4
+    inverted: true
+  dump: all
+  tolerance: 25%
+
+number:
+  - platform: template
+    name: "AC Temperatur"
+    id: ac_temp
+    min_value: 18
+    max_value: 32
+    step: 1
+    initial_value: 24
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°C"
+    mode: box
+    set_action:
+      - script.execute:
+          id: send_ac
+          b3: 48
+
+select:
+  - platform: template
+    name: "AC Fläkt"
+    id: ac_fan
+    options: ["Auto", "1/3", "2/3", "3/3"]
+    initial_option: "Auto"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute:
+          id: send_ac
+          b3: 48
+  - platform: template
+    name: "AC Läge"
+    id: ac_mode
+    options: ["Kyla", "Avfuktning", "Fläkt", "Comfort", "Av"]
+    initial_option: "Av"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute:
+          id: send_ac
+          b3: 48
+
+script:
+  - id: send_ac
+    mode: restart
+    parameters:
+      b3: int
+    then:
+      - delay: 100ms   # väntar tills select/number hunnit uppdatera sitt värde
+      - remote_transmitter.transmit_raw:
+          carrier_frequency: 38kHz
+          code: !lambda |-
+            static const uint8_t FANBITS[4] = {0x0, 0x2, 0x1, 0x3};          // auto,1/3,2/3,3/3
+            static const uint8_t MODEB[5]   = {0x80, 0xC0, 0xA0, 0x88, 0x00}; // kyla,avfukt,fläkt,comfort,av
+            int mode = id(ac_mode).active_index().value_or(4);
+            int fan  = id(ac_fan).active_index().value_or(0);
+            int temp = (int) id(ac_temp).state;
+            if (temp < 18) temp = 18;
+            if (temp > 32) temp = 32;
+            if (mode == 3) fan = 0;                  // comfort = fläkt auto
+            uint8_t v = temp - 12;
+            uint8_t b1 = ((v & 1) << 7) | (((v >> 1) & 1) << 6) | (((v >> 2) & 1) << 5) |
+                         (((v >> 3) & 1) << 4) | (((v >> 4) & 1) << 3) | FANBITS[fan];
+            uint8_t bytes[5] = {0xD2, b1, MODEB[mode], (uint8_t) b3, 0x00};
+            std::vector<int32_t> c;
+            c.reserve(86);
+            c.push_back(9151); c.push_back(-4575);
+            for (int i = 0; i < 5; i++)
+              for (int bit = 7; bit >= 0; bit--) {
+                c.push_back(520);
+                c.push_back(((bytes[i] >> bit) & 1) ? -1690 : -590);
+              }
+            c.push_back(520); c.push_back(-10124);
+            return c;
+
+# ===== Termostat =====
+sensor:
+  - platform: homeassistant
+    id: room_temp
+    entity_id: sensor.YOUR_ROOM_TEMPERATURE_SENSOR
+    internal: true
+
+climate:
+  - platform: thermostat
+    name: "AC Termostat"
+    id: ac_thermostat
+    sensor: room_temp
+    default_preset: Standard
+    preset:
+      - name: Standard
+        default_target_temperature_high: 24
+    visual:
+      min_temperature: 18
+      max_temperature: 32
+      temperature_step:
+        target_temperature: 1
+        current_temperature: 0.1
+    # Kompressorskydd och hysteres
+    min_cooling_off_time: 180s
+    min_cooling_run_time: 180s
+    min_idle_time: 5s
+    min_fanning_off_time: 5s
+    min_fanning_run_time: 5s
+    min_fan_mode_switching_time: 2s
+    cool_deadband: 0.5     # börja kyla när rummet är 0,5° över mål
+    cool_overrun: 0.3      # fortsätt tills rummet är 0,3° under mål
+    cool_action:
+      - logger.log:
+          format: "Termostat: kyla, rum %.1f, mal %.1f"
+          args: ['id(room_temp).state', 'id(ac_thermostat).target_temperature']
+      - number.set:
+          id: ac_temp
+          value: !lambda 'return roundf(clamp(id(ac_thermostat).target_temperature, 18.0f, 32.0f));'
+      - select.set:
+          id: ac_mode
+          option: "Kyla"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    idle_action:
+      - select.set:
+          id: ac_mode
+          option: "Av"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    fan_only_action:
+      - select.set:
+          id: ac_mode
+          option: "Fläkt"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    auto_mode:        # visas som "Auto" i kortet = Comfort (hus-symbolen)
+      - select.set:
+          id: ac_mode
+          option: "Comfort"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    dry_action:       # Avfuktning
+      - select.set:
+          id: ac_mode
+          option: "Avfuktning"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    off_mode:
+      - select.set:
+          id: ac_mode
+          option: "Av"
+      - script.execute:
+          id: send_ac
+          b3: 48
+    fan_mode_auto_action:
+      - select.set:
+          id: ac_fan
+          option: "Auto"
+    fan_mode_low_action:
+      - select.set:
+          id: ac_fan
+          option: "1/3"
+    fan_mode_medium_action:
+      - select.set:
+          id: ac_fan
+          option: "2/3"
+    fan_mode_high_action:
+      - select.set:
+          id: ac_fan
+          option: "3/3"
